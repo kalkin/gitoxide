@@ -1,3 +1,6 @@
+use moonwalk::{DirEntry, WalkState};
+use std::ffi::OsString;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     ffi::OsStr,
     path::{Path, PathBuf},
@@ -17,26 +20,34 @@ fn find_git_repository_workdirs<P: Progress>(
     mut progress: P,
     debug: bool,
     threads: Option<usize>,
-) -> impl Iterator<Item = (PathBuf, gix::Kind)>
+) -> anyhow::Result<Vec<(PathBuf, gix::Kind)>>
 where
     P::SubProgress: Sync,
 {
     progress.init(None, progress::count("filesystem items"));
-    fn is_repository(path: &Path) -> Option<gix::Kind> {
-        // Can be git dir or worktree checkout (file)
-        if path.file_name() != Some(OsStr::new(".git")) {
-            return None;
-        }
-
-        if path.is_dir() {
-            if path.join("HEAD").is_file() && path.join("config").is_file() {
-                gix::discover::is_git(path).ok().map(Into::into)
+    fn is_repository(path: &Path, is_dir: bool) -> Option<gix::Kind> {
+        if is_dir {
+            if path.file_name() == Some(OsStr::new(".git")) {
+                gix::discover::is_git(&path).ok().map(Into::into)
             } else {
-                None
+                let git_dir = path.join(".git");
+                let meta = git_dir.metadata().ok()?;
+                if meta.is_file() {
+                    Some(gix::Kind::WorkTree { is_linked: true })
+                } else if meta.is_dir() {
+                    if git_dir.join("HEAD").is_file() && git_dir.join("config").is_file() {
+                        gix::discover::is_git(&git_dir).ok().map(Into::into)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
             }
-        } else {
-            // git files are always worktrees
+        } else if path.file_name() == Some(OsStr::new(".git")) {
             Some(gix::Kind::WorkTree { is_linked: true })
+        } else {
+            None
         }
     }
     fn into_workdir(git_dir: PathBuf) -> PathBuf {
@@ -47,44 +58,69 @@ where
         }
     }
 
-    #[derive(Debug, Default)]
-    struct State {
-        kind: Option<gix::Kind>,
+    let entries = std::sync::Mutex::new(Vec::new());
+    let seen = AtomicUsize::default();
+    #[derive(Clone)]
+    struct Delegate<'a> {
+        path: PathBuf,
+        entries: &'a std::sync::Mutex<Vec<(PathBuf, gix::Kind)>>,
+        seen: &'a AtomicUsize,
+        debug: bool,
     }
 
-    let walk = jwalk::WalkDirGeneric::<((), State)>::new(root)
-        .follow_links(false)
-        .sort(true)
-        .skip_hidden(false)
-        .parallelism(jwalk::Parallelism::RayonNewPool(threads.unwrap_or(0)));
+    let mut walk = moonwalk::WalkBuilder::new();
+    walk.follow_links(false);
+    let root = root.as_ref();
+    walk.run_parallel(
+        root.as_ref(),
+        threads.unwrap_or(0),
+        Delegate {
+            path: Default::default(),
+            entries: &entries,
+            seen: &seen,
+            debug,
+        },
+        root.as_os_str().to_owned(),
+    )?;
 
-    walk.process_read_dir(move |_depth, path, _read_dir_state, siblings| {
-        if debug {
-            eprintln!("{}", path.display());
-        }
-        let mut found_any_repo = false;
-        let mut found_bare_repo = false;
-        for entry in siblings.iter_mut().flatten() {
-            let path = entry.path();
-            if let Some(kind) = is_repository(&path) {
-                let is_bare = kind.is_bare();
-                entry.client_state = State { kind: kind.into() };
-                entry.read_children_path = None;
+    if debug {
+        dbg!(seen.load(Ordering::Relaxed));
+    }
+    return Ok(entries.into_inner()?);
 
-                found_any_repo = true;
-                found_bare_repo = is_bare;
+    impl<'b> moonwalk::VisitorParallel for Delegate<'b> {
+        type State = OsString;
+
+        fn visit<'a>(
+            &mut self,
+            parents: impl Iterator<Item = &'a Self::State>,
+            dent: std::io::Result<&mut DirEntry<'_>>,
+        ) -> WalkState<Self::State> {
+            match dent {
+                Ok(dent) => {
+                    self.seen.fetch_add(1, Ordering::SeqCst);
+                    self.path.clear();
+                    self.path.extend(parents.collect::<Vec<_>>().into_iter().rev());
+                    self.path.push(dent.file_name());
+                    if self.debug && dent.file_type().is_dir() {
+                        eprintln!("{}", self.path.display());
+                    }
+                    if let Some(kind) = is_repository(&self.path, dent.file_type().is_dir()) {
+                        self.entries
+                            .lock()
+                            .unwrap()
+                            .push((into_workdir(self.path.clone()), kind));
+                        WalkState::Skip
+                    } else {
+                        WalkState::Continue(dent.file_name().to_owned())
+                    }
+                }
+                Err(_err) => WalkState::Skip,
             }
         }
-        // Only return paths which are repositories are further participating in the traversal
-        // Don't let bare repositories cause siblings to be pruned.
-        if found_any_repo && !found_bare_repo {
-            siblings.retain(|e| e.as_ref().map(|e| e.client_state.kind.is_some()).unwrap_or(false));
-        }
-    })
-    .into_iter()
-    .inspect(move |_| progress.inc())
-    .filter_map(Result::ok)
-    .filter_map(|mut e| e.client_state.kind.take().map(|kind| (into_workdir(e.path()), kind)))
+
+        fn pop_dir<'a>(&mut self, _state: Self::State, _parents: impl Iterator<Item = &'a Self::State>) {}
+    }
 }
 
 fn find_origin_remote(repo: &Path) -> anyhow::Result<Option<gix_url::Url>> {
@@ -216,7 +252,7 @@ where
     <P::SubProgress as Progress>::SubProgress: Sync,
 {
     for (git_workdir, _kind) in
-        find_git_repository_workdirs(source_dir, progress.add_child("Searching repositories"), debug, threads)
+        find_git_repository_workdirs(source_dir, progress.add_child("Searching repositories"), debug, threads)?
     {
         writeln!(&mut out, "{}", git_workdir.display())?;
     }
@@ -236,7 +272,7 @@ where
     let mut num_errors = 0usize;
     let destination = destination.as_ref().canonicalize()?;
     for (path_to_move, kind) in
-        find_git_repository_workdirs(source_dir, progress.add_child("Searching repositories"), false, threads)
+        find_git_repository_workdirs(source_dir, progress.add_child("Searching repositories"), false, threads)?
     {
         if let Err(err) = handle(mode, kind, &path_to_move, &destination, &mut progress) {
             progress.fail(format!(

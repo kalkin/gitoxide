@@ -1269,8 +1269,8 @@ dependencies = [
  "gix-transport",
  "gix-url",
  "itertools",
- "jwalk",
  "mime_guess",
+ "moonwalk",
  "rusqlite",
  "serde",
  "serde_json",
@@ -3056,6 +3056,21 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.45.0",
+]
+
+[[package]]
+name = "moonwalk"
+version = "0.1.0"
+source = "git+https://github.com/pascalkuthe/moonwalk#7f7d8604ed69c237eaa8d465b887ef0dc31ac096"
+dependencies = [
+ "crossbeam-deque",
+ "crossbeam-utils",
+ "errno",
+ "libc",
+ "memoffset 0.8.0",
+ "parking_lot",
+ "rustix",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
